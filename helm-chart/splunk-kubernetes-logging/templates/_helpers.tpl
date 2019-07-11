@@ -32,17 +32,6 @@ Create chart name and version as used by the chart label.
 {{- end -}}
 
 {{/*
-Create chart name and version as used by the chart label.
-*/}}
-{{- define "splunk-kubernetes-logging.secret" -}}
-{{- if .Values.secret.name -}}
-{{- printf "%s" .Values.secret.name -}}
-{{- else -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
 Convert memory value from resources.limit to fluentd buffer.
 Rules:
 * fluentd does not support *i units
@@ -96,23 +85,119 @@ elif startswith({{ list (or .from.container .name) .from.pod | join "/" | quote 
 else empty
 end;
 
-def set_namespace(value):
-if value == "default"
-then
-{{- $index := or .Values.splunk.hec.indexRoutingDefaultIndex .Values.global.splunk.hec.indexRoutingDefaultIndex | default "main" | quote}}
-{{- printf " %s" $index -}}
-else value
-end;
-
 def extract_container_info:
   (.source | ltrimstr("/var/log/containers/") | split("_")) as $parts
   | ($parts[-1] | split("-")) as $cparts
   | .pod = $parts[0]
-  | .namespace = set_namespace($parts[1])
+  | .namespace = $parts[1]
   | .container_name = ($cparts[:-1] | join("-"))
   | .container_id = ($cparts[-1] | rtrimstr(".log"))
-  | .cluster_name = "{{ or .Values.kubernetes.clusterName .Values.global.kubernetes.clusterName | default "cluster_name" }}"
   | .;
-
+  
 .record | extract_container_info | .sourcetype = (find_sourcetype(.pod; .container_name) // "kube:container:\(.container_name)")
 {{- end -}}
+
+{{/*
+Converts a path glob to a regular expression.
+*/}}
+{{- define "splunk-kubernetes-logging.glob_to_regex" -}}
+  {{- $str := . -}}
+  {{- $str := $str | replace "\\" "\\\\" -}}
+  {{- $str := $str | replace "." "\\." -}}
+  {{- $str := $str | replace "*" ".*" -}}
+  {{- $str := $str | replace "?" "\\?" -}}
+  {{- $str := $str | replace "{" "\\{" -}}
+  {{- $str := $str | replace "}" "\\}" -}}
+  {{- $str := $str | replace "(" "\\(" -}}
+  {{- $str := $str | replace ")" "\\)" -}}
+  {{- $str := $str | replace "[" "\\[" -}}
+  {{- $str := $str | replace "]" "\\]" -}}
+  {{- $str := $str | replace "^" "\\^" -}}
+  {{- $str := $str | replace "$" "\\$" -}}
+  {{- print "^" $str "$" -}}
+{{- end }}
+
+{{/*
+Generates the jq_transformer query to ensure each record has the appropriate index.
+*/}}
+{{- define "splunk-kubernetes-logging.index_jq_filter" -}}
+  {{- $splunkHecIndex := (or .Values.splunk.hec.indexName .Values.global.splunk.hec.indexName) -}}
+  {{- $logDefsByIndexTag := dict -}}
+  {{- range $name, $logDef := .Values.logs -}}
+    {{- if (hasKey $logDef "index") -}}
+      {{- $index := or $logDef.index $splunkHecIndex -}}
+      {{- if (ne $index $splunkHecIndex) -}}
+        {{- $sourcetype := or $logDef.sourcetype $name -}}
+        {{- $tag := dict "value" "" -}}
+
+        {{- if $logDef.from.pod -}}
+          {{- $_ := set $tag "value" "tail.containers.*" -}}
+        {{- else if $logDef.from.file -}}
+          {{- $_ := set $tag "value" (print "tail.file." $sourcetype) -}}
+        {{- else if $logDef.from.journald -}}
+          {{- $_ := set $tag "value" (print "journald." $sourcetype) -}}
+        {{- else -}}
+          {{- print "def TODO_support_log_" $name ": " ($logDef | toJson) "; " -}}
+        {{- end }}
+
+        {{- $logDefsByTag := or (pluck $index $logDefsByIndexTag | first) (dict) -}}
+        {{- $logDefs := or (pluck $tag.value | first) (list) -}}
+        {{- $appendedLogDefs := append $logDefs (and (set $logDef "name" $name)) -}}
+        {{- $appendedLogDefsByTag := set $logDefsByTag $tag.value $appendedLogDefs -}}
+        {{- $_ := set $logDefsByIndexTag $index $appendedLogDefsByTag -}}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+
+  {{- $isFirstIndex := dict "value" true -}}
+  {{- range $index, $logDefsByTag := $logDefsByIndexTag -}}
+    {{- if $isFirstIndex.value -}}
+      {{- print "if" -}}
+      {{- $_ := set $isFirstIndex "value" false -}}
+    {{- else -}}
+    {{- print " elif" -}}
+    {{- end }}
+    {{- $isFirstTag := dict "value" true -}}
+    {{- range $tag, $logDefs := $logDefsByTag -}}
+      {{- if $isFirstTag.value -}}
+        {{- print " (" -}}
+        {{- $_ := set $isFirstTag "value" false -}}
+      {{- else -}}
+        {{- print " or (" -}}
+      {{- end }}
+      {{- print ".tag == " ($tag | quote) " and (" -}}
+      {{- $isFirstLogDef := dict "value" true -}}
+      {{- range $logDef := $logDefs -}}
+        {{- if $isFirstLogDef.value -}}
+          {{- print "(" -}}
+          {{- $_ := set $isFirstLogDef "value" false -}}
+        {{- else -}}
+          {{- print " or (" -}}
+        {{- end }}
+        {{- print ".record.sourcetype == " (or $logDef.sourcetype $logDef.name | quote) -}}
+
+        {{- if $logDef.from.file -}}
+          {{- print " and (.record.source | test(" (include "splunk-kubernetes-logging.glob_to_regex" $logDef.from.file.path | quote) "))" -}}
+        {{- else if $logDef.from.journald -}}
+          {{- print " and .record.source == " (print "/run/log/journal/" $logDef.from.journald.unit | quote) -}}
+        {{- else if $logDef.from.pod -}}
+          {{- print " and (.record.pod | startswith(" ($logDef.from.pod | quote) "))" -}}
+          {{- if (hasKey $logDef.from "container") -}}
+            {{- print " and .record.container == " ($logDef.from.container | quote) -}}
+          {{- end }}
+        {{- end }}
+        {{- print ")" -}}
+      {{- end }}
+      {{- print "))" -}}
+    {{- end }}
+    {{- print " then .record | .index = " ($index | quote) -}}
+  {{- end }}
+  {{- $isAnyIndex := ne 0 (len $logDefsByIndexTag) -}}
+  {{- if $isAnyIndex -}}
+    {{- print " else " -}}
+  {{- end }}
+  {{- print ".record | .index = " ($splunkHecIndex | quote) -}}
+  {{- if $isAnyIndex -}}
+    {{- print " end" -}}
+  {{- end }}
+{{- end }}
